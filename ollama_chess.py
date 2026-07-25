@@ -6,12 +6,13 @@ import ollama
 import chess
 import logging
 
-# Silence generic network warnings
+# Completely silence generic network and library warning logs in the terminal
 logging.getLogger("urllib3").setLevel(logging.ERROR)
+logging.getLogger("berserk").setLevel(logging.ERROR)
 
 # --- CONFIGURATION ---
-LICHESS_TOKEN = "INSERT API HERE"
-MODEL_NAME = "INSERT EXACT BOT NAME HERE" 
+LICHESS_TOKEN = "API_KEY_HERE"
+MODEL_NAME = "MODEL_NAME_HERE" 
 
 session = berserk.TokenSession(LICHESS_TOKEN)
 client = berserk.Client(session=session)
@@ -21,14 +22,21 @@ last_processed_move_count = -1
 
 try:
     BOT_USER_ID = client.account.get()['id']
-    print(f"Logged in successfully! Bot User ID: {BOT_USER_ID}")
+    print(f"Logged in as {BOT_USER_ID}")
 except Exception as e:
     print(f"Authentication failed: {e}")
     exit(1)
 
-def get_ollama_move(board, legal_moves):
-    """Prompts Ollama for a move with strict safety fallbacks."""
-    print(f"[{MODEL_NAME}] Thinking...")
+def send_lichess_chat(game_id, message):
+    """Safely sends a message to the Lichess game chat without breaking the loop."""
+    try:
+        client.board.write_chat_message(game_id, room="player", text=message)
+    except Exception:
+        pass  # Ignore chat errors to keep the main game running smoothly
+
+def get_ollama_move(game_id, board, legal_moves):
+    """Prompts Ollama for a move. Hides errors from terminal and routes them to Lichess chat."""
+    print(f"[{MODEL_NAME}]  Is thinking...")
     
     prompt = (
         f"You are an expert chess engine. Current FEN: {board.fen()}.\n"
@@ -50,12 +58,20 @@ def get_ollama_move(board, legal_moves):
             return ai_move
         else:
             fallback = random.choice(legal_moves)
-            print(f"[{MODEL_NAME}] Hallucinated '{ai_move}'. Playing fallback: {fallback}")
+            # Route hallucination error to Lichess chat instead of terminal
+            send_lichess_chat(
+                game_id, 
+                f"🤖 [System Notice]: {MODEL_NAME} hallucinated an illegal move '{ai_move}'. Playing random fallback: {fallback}"
+            )
             return fallback
             
     except Exception as e:
         fallback = random.choice(legal_moves)
-        print(f"[{MODEL_NAME}] Error ({e}). Defaulting to random move: {fallback}")
+        # Route connection/parsing errors to Lichess chat instead of terminal
+        send_lichess_chat(
+            game_id, 
+            f"🤖 [System Error]: {str(e)[:80]}. Defaulting to random move: {fallback}"
+        )
         return fallback
 
 def play_game(game_id):
@@ -74,6 +90,10 @@ def play_game(game_id):
             else:
                 bot_color = chess.BLACK
                 print("Bot assigned as BLACK.")
+            
+            # Send a friendly greeting in chat at game start
+            send_lichess_chat(game_id, f"{MODEL_NAME} is playing.")
+            
         elif event['type'] == 'gameState':
             state = event
         else:
@@ -91,28 +111,26 @@ def play_game(game_id):
         for move in played_moves:
             board.push_uci(move)
 
-        # CRITICAL PROTECTION: Turn detection combined with move count verification
+        # Turn detection combined with move count verification
         if board.turn == bot_color and current_move_count > last_processed_move_count:
-            # Update the tracker immediately BEFORE thinking to block rapid duplicate stream events
             last_processed_move_count = current_move_count
             
             legal_moves = [move.uci() for move in board.legal_moves]
-            chosen_move = get_ollama_move(board, legal_moves)
+            # Pass the game_id into the calculation function so it can access the chat
+            chosen_move = get_ollama_move(game_id, board, legal_moves)
             
             try:
                 client.bots.make_move(game_id, chosen_move)
                 print(f"Played move: {chosen_move}\n")
-                
-                # Update tracker again to equal the newly updated board state count
                 last_processed_move_count = current_move_count + 1
             except Exception as e:
-                print(f"Failed to submit move {chosen_move}: {e}")
-                # Reset tracker on failure so the bot can try again on the next event pump
+                # Send the final submission failure to chat if Lichess rejects the API request
+                send_lichess_chat(game_id, f"🤖 [Submission Error]: Failed to push {chosen_move}. Retrying...")
                 last_processed_move_count = current_move_count - 1
 
 def main_loop():
-    """Infinitely listens for games until you press Ctrl+C."""
-    print(f"[{MODEL_NAME}] Online,waiting for lichess game...")
+    """Press Ctrl C to cancel."""
+    print(f"[{MODEL_NAME}] Waiting for a game...")
     
     while True:
         try:
@@ -125,7 +143,7 @@ def main_loop():
                     game_id = event['game']['id']
                     play_game(game_id)
         except Exception as e:
-            print(f"Error encountered: {e}. Reconnecting in 5 seconds...")
+            # Keep terminal loop stable but pause briefly if a major internet drop happens
             time.sleep(5)
 
 if __name__ == "__main__":
