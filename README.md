@@ -1,5 +1,5 @@
 To install...
-- Install all of the files above.
+- Install all of the files except readme.md above.
 - Install stockfish,and name it stockfish.
 - Have a lichess account set as bot.
 - Make a new api key and check all boxes.
